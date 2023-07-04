@@ -1,3 +1,57 @@
+import torch
+import torch.nn.functional as F
+from torch import nn, einsum
+
+from einops import rearrange, repeat
+
+# helper functions
+
+def exists(val):
+    return val is not None
+
+# feedforward
+
+def FeedForward(dim, mult = 4, dropout = 0.):
+    hidden_dim = int(dim * mult)
+    return nn.Sequential(
+        nn.LayerNorm(dim),
+        nn.Linear(dim, hidden_dim, bias = False),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(hidden_dim, dim, bias = False)
+    )
+
+# rotary positional embedding
+# https://arxiv.org/abs/2104.09864
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, max_seq_len, *, device):
+        seq = torch.arange(max_seq_len, device = device, dtype = self.inv_freq.dtype)
+        freqs = einsum("i , j -> i j", seq, self.inv_freq)
+        return torch.cat((freqs, freqs), dim = -1)
+
+
+def rotate_half(x):
+    x = rearrange(x, "... (j d) -> ... j d", j = 2)
+    x1, x2 = x.unbind(dim = -2)
+    return torch.cat((-x2, x1), dim = -1)
+
+
+def apply_rotary_pos_emb(pos, t):
+    seq_len, rotate_dim = t.shape[-2], pos.shape[-1]
+    pos = pos[..., -seq_len:, :]
+    t, t_pass = t[..., :rotate_dim], t[..., rotate_dim:]
+    t = (t * pos.cos()) + (rotate_half(t) * pos.sin())
+    return torch.cat((t, t_pass), dim = -1)
+
+# attention
+
+
 class PerceiverAR(nn.Module):
     def __init__(
         self,
@@ -49,40 +103,47 @@ class PerceiverAR(nn.Module):
         labels = None
     ):
         batch_size, seq_len, emb_size, device = x.shape, x.device
-      
-        pos = self.pos_emb(torch.arange(seq_len, device = device))
-      
-        x = x + pos
-    
-        latents = pos.reshape(-1, 16, emb_size)
-      
+        
+        x = x + self.pos_emb(torch.arange(seq_len, device = device))
+        
+        rotary_pos_emb1 = self.rotary_pos_emb(16, device = device)
+        rotary_pos_emb2 = self.rotary_pos_emb(seq_len/4, device = device)
+
+        latents = self.pos_emb(torch.arange(seq_len / 4, device = device)).unsqueeze(0)
+        latents = latents.repeat(batch_size, 1, 1)
+        latents = latents.reshape(-1, 4, emb_size)
         x = x.reshape(-1, 16, emb_size)
 
-        for attn, ff in self.layers:
-            x = attn(x, rotary_pos_emb = rotary_pos_emb) + x
-            x = ff(x) + x
+        for i in range(len(self.layer_configs)):
+            for attn, ff in self.layers:
+                x = attn(x, rotary_pos_emb = rotary_pos_emb1) + x
+                x = ff(x) + x
+                
+            for cross_attn, ff in self.perceive_layers:
+                latents = cross_attn(latents, x, context_mask = prefix_mask, rotary_pos_emb = rotary_pos_emb1) + latents
+                latents = ff(latents) + latents
+                
+            latents = latents.reshape(batch_size, -1, emb_size)
+            
+            for attn, ff in self.layers:
+                latents = attn(latents, rotary_pos_emb = rotary_pos_emb2) + latents
+                latents = ff(latents) + latents
+                
+            latents_leading, latents_last = latents[:, :-1,:], latents[:, -1:,:]
+            latents = torch.cat([torch.zeros_like(latents_last), latents_leading], dim=1)
+            latents = latents.reshape(-1, 4, emb_size)
+            
+            for cross_attn, ff in self.perceive_layers:
+                x = cross_attn(x, latents, context_mask = prefix_mask, rotary_pos_emb = rotary_pos_emb1) + x
+                x = ff(x) + x
 
-        for cross_attn, ff in self.perceive_layers:
-            latents = cross_attn(latents, x, context_mask = prefix_mask, rotary_pos_emb = rotary_pos_emb) + latents
-            latents = ff(latents) + latents
+            for attn, ff in self.layers:
+                x = attn(x, rotary_pos_emb = rotary_pos_emb1) + x
+                x = ff(x) + x
 
-        latents = latents.reshape(batch_size, -1, emb_size)
-        latents_leading, latents_last = latents[:, :-1,:], latents[:, -1:,:]
-        latents = torch.cat([torch.zeros_like(latents_last), latents_leading], dim=1)
-
-        for attn, ff in self.layers:
-            latents = attn(latents, rotary_pos_emb = rotary_pos_emb) + latents
-            latents = ff(latents) + latents
-          
-        latents = latents.reshape(-1, 16, emb_size)
-      
-        for cross_attn, ff in self.perceive_layers:
-            x = cross_attn(x, latents, context_mask = prefix_mask, rotary_pos_emb = rotary_pos_emb) + x
-            x = ff(x) + x
-
-        latents = latents.reshape(batch_size, -1, emb_size)
-        latents = torch.cat([latents[:, 1:,:], latents_last], dim=1)
-
+            latents = latents.reshape(batch_size, -1, emb_size)
+            latents = torch.cat([latents[:, 1:,:], latents_last], dim=1)
+            
         x = x.reshape(batch_size, -1, emb_size)
 
 
