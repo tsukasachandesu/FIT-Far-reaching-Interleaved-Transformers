@@ -147,4 +147,16 @@ class PerceiverAR(nn.Module):
         x = x.reshape(batch_size, -1, emb_size)
 
 
+    self.x_mask = 1. - get_ar_mask(x_per_group, dtype=tf.float32)
+    self.l_mask = 1. - get_chunk_ar_mask(
+        num_groups * latents_per_group, latents_per_group, dtype=tf.float32)
+    todo マスクはまだ未実装
+
+A Domain-Knowledge-Inspired Music Embedding Space and a Novel Attention
+Mechanism for Symbolic Music Modeling
+
+Controlling Perceived Emotion in Symbolic Music Generation
+with Monte Carlo Tree Search
+
+
 
